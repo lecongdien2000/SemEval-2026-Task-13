@@ -11,11 +11,13 @@ from torch.amp import autocast
 from dotenv import load_dotenv
 
 try:
-    from src.src_TaskA.models.model import FusionCodeClassifier
+    # the model class is defined as HybridClassifier in model.py
+    from src.src_TaskA.models.model import HybridClassifier
     from src.src_TaskA.features.stylometry import StylometryExtractor
 except ImportError:
+    # fallback when running as script from root
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-    from src_TaskA.models.model import FusionCodeClassifier
+    from src_TaskA.models.model import HybridClassifier
     try:
         from src_TaskA.features.stylometry import StylometryExtractor
     except ImportError:
@@ -92,8 +94,8 @@ def load_model_for_submission(config_path: str, checkpoint_dir: str, device: tor
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 
-    logger.info("Initializing FusionCodeClassifier...")
-    model = FusionCodeClassifier(config)
+    logger.info("Initializing HybridClassifier (previously FusionCodeClassifier)...")
+    model = HybridClassifier(config)
     
     checkpoint_path = os.path.join(checkpoint_dir, "best_model.pt")
     if not os.path.exists(checkpoint_path):
@@ -109,7 +111,7 @@ def load_model_for_submission(config_path: str, checkpoint_dir: str, device: tor
 # 3. Inference Loop
 # -----------------------------------------------------------------------------
 def run_inference_pipeline(
-    model: FusionCodeClassifier, 
+    model: HybridClassifier, 
     test_df: pd.DataFrame, 
     id_col_name: str,
     output_file: str, 
