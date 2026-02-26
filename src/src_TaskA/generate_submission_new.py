@@ -193,6 +193,14 @@ def generate_submission(args):
     
     return submission_df
 
+class SubmissionArgs:
+    """Simple argument container for non-CLI usage (e.g., Kaggle notebooks)."""
+    def __init__(self, test_file, checkpoint_dir, output_file="submission.csv", batch_size=32):
+        self.test_file = test_file
+        self.checkpoint_dir = checkpoint_dir
+        self.output_file = output_file
+        self.batch_size = batch_size
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Generate submission CSV for SemEval Task A using trained model"
@@ -225,3 +233,21 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     submission_df = generate_submission(args)
+
+# ============================================================================
+# USAGE IN KAGGLE NOTEBOOKS
+# ============================================================================
+# 
+# In a Kaggle notebook cell, use the following code:
+#
+# from src.src_TaskA.generate_submission_AI import generate_submission, SubmissionArgs
+#
+# args = SubmissionArgs(
+#     test_file="/kaggle/input/sem-eval-2026-task-13-subtask-a/Task_A/test.parquet",
+#     checkpoint_dir="/kaggle/input/your-model-checkpoint",  # or any local path
+#     output_file="submission.csv",
+#     batch_size=32
+# )
+#
+# submission_df = generate_submission(args)
+#
