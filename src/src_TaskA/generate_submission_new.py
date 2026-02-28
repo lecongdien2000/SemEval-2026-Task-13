@@ -164,7 +164,7 @@ def generate_submission(args):
     logger.info("Running inference on test set...")
     all_predictions = []
     all_probabilities = []
-    # all_ids = []
+    all_ids = []
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Generating predictions"):
@@ -182,6 +182,8 @@ def generate_submission(args):
             # all_ids.extend(batch["id"])  # This should be a list of string IDs
 
     logger.info(f"Inference complete. Generated {len(all_predictions)} predictions.")
+
+    all_ids = test_df['id'].tolist()
 
     # 6. Create Submission DataFrame
     submission_df = pd.DataFrame({
