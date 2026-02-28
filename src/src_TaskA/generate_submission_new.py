@@ -164,7 +164,7 @@ def generate_submission(args):
     logger.info("Running inference on test set...")
     all_predictions = []
     all_probabilities = []
-    all_ids = []
+    # all_ids = []
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Generating predictions"):
@@ -179,7 +179,7 @@ def generate_submission(args):
             
             all_predictions.extend(preds.cpu().numpy().tolist())
             all_probabilities.extend(probs.cpu().numpy().tolist())
-            all_ids.extend(batch["id"])  # This should be a list of string IDs
+            # all_ids.extend(batch["id"])  # This should be a list of string IDs
 
     logger.info(f"Inference complete. Generated {len(all_predictions)} predictions.")
 
