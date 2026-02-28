@@ -38,6 +38,7 @@ def prepare_test_data(test_path, config, device):
     """
     Prepares test data by checking if features are present.
     If not, extracts them using AgnosticFeatureExtractor.
+    Caches processed data in current working directory (handles read-only /kaggle/input).
     """
     logger.info(f"Loading test data: {test_path}")
     df = pd.read_parquet(test_path)
@@ -48,10 +49,20 @@ def prepare_test_data(test_path, config, device):
     
     logger.info("Features missing. Initializing Feature Extractor (this may take a while)...")
     
-    cache_path = test_path.replace(".parquet", "_processed.parquet")
+    # Save cache to current working directory instead of input directory (handles read-only /kaggle/input)
+    test_filename = os.path.basename(test_path)
+    cache_filename = test_filename.replace(".parquet", "_processed.parquet")
+    cache_path = os.path.join(os.getcwd(), cache_filename)
+    
+    # Also check original location in case it exists there
+    original_cache_path = test_path.replace(".parquet", "_processed.parquet")
+    
     if os.path.exists(cache_path):
         logger.info(f"Found cached processed file: {cache_path}")
         return pd.read_parquet(cache_path)
+    elif os.path.exists(original_cache_path):
+        logger.info(f"Found cached processed file: {original_cache_path}")
+        return pd.read_parquet(original_cache_path)
 
     extractor = AgnosticFeatureExtractor(config, str(device))
     
