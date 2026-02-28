@@ -85,14 +85,18 @@ def generate_submission(args):
     logger.info(f"Compute Device: {device}")
 
     # 1. Load Configuration
+    # Try loading config from checkpoint_dir, and if not found, try best_model subdirectory
     config_path = os.path.join(args.checkpoint_dir, "config.yaml")
     if not os.path.exists(config_path):
-        logger.error(f"Config not found in {args.checkpoint_dir}")
+        config_path = os.path.join(args.checkpoint_dir, "best_model", "config.yaml")
+    
+    if not os.path.exists(config_path):
+        logger.error(f"Config not found in {args.checkpoint_dir} or {args.checkpoint_dir}/best_model")
         sys.exit(1)
         
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
-    logger.info("Configuration loaded successfully.")
+    logger.info(f"Configuration loaded from {config_path}")
 
     # 2. Prepare Test Data (extract features if needed)
     test_df = prepare_test_data(args.test_file, config, device)
@@ -108,11 +112,17 @@ def generate_submission(args):
 
     # 3. Load Model & Tokenizer
     logger.info("Loading Model & Tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(args.checkpoint_dir)
+    # Determine the actual checkpoint directory (might be in best_model subdirectory)
+    actual_checkpoint_dir = args.checkpoint_dir
+    best_model_dir = os.path.join(args.checkpoint_dir, "best_model")
+    if os.path.exists(best_model_dir):
+        actual_checkpoint_dir = best_model_dir
+    
+    tokenizer = AutoTokenizer.from_pretrained(actual_checkpoint_dir)
     
     model = HybridClassifier(config)
     
-    weights_path = os.path.join(args.checkpoint_dir, "model_state.bin")
+    weights_path = os.path.join(actual_checkpoint_dir, "model_state.bin")
     if not os.path.exists(weights_path):
         logger.error(f"Model weights not found at {weights_path}")
         sys.exit(1)
