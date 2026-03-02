@@ -1,5 +1,7 @@
 import os
 import sys
+import shutil
+import re
 import transformers.utils.import_utils
 import transformers.modeling_utils
 
@@ -77,11 +79,87 @@ def save_checkpoint(model, tokenizer, path, epoch, metrics, config):
     with open(os.path.join(path, "training_meta.yaml"), "w") as f:
         yaml.dump({"epoch": epoch, "metrics": metrics}, f)
 
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+def _extract_samples_from_path(path):
+    match = re.search(r"samples_(\d+)", path.replace("\\", "/"))
+    return _safe_int(match.group(1), 0) if match else 0
+
+def find_latest_checkpoint(checkpoint_dir):
+    """
+    Finds the latest checkpoint available in checkpoint_dir recursively.
+    Ranking priority:
+    1) global_samples_seen (if available)
+    2) epoch
+    3) step
+    4) file mtime
+    """
+    if not os.path.exists(checkpoint_dir):
+        return None
+
+    candidates = []
+    for root, _, files in os.walk(checkpoint_dir):
+        if "model_state.bin" not in files:
+            continue
+
+        model_path = os.path.join(root, "model_state.bin")
+        meta_path = os.path.join(root, "training_meta.yaml")
+
+        epoch = 0
+        step = 0
+        global_samples_seen = 0
+        f1_macro = None
+
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r") as f:
+                    meta = yaml.safe_load(f) or {}
+                epoch = _safe_int(meta.get("epoch", 0), 0)
+                metric_obj = meta.get("metrics", {}) or {}
+                global_samples_seen = _safe_int(
+                    metric_obj.get("global_samples_seen", 0), 0
+                )
+                step = _safe_int(metric_obj.get("step", 0), 0)
+                f1_macro = metric_obj.get("f1_macro", None)
+            except Exception:
+                pass
+
+        if global_samples_seen == 0:
+            global_samples_seen = _extract_samples_from_path(root)
+
+        candidates.append({
+            "path": root,
+            "epoch": epoch,
+            "step": step,
+            "global_samples_seen": global_samples_seen,
+            "f1_macro": f1_macro,
+            "mtime": os.path.getmtime(model_path)
+        })
+
+    if not candidates:
+        return None
+
+    return max(
+        candidates,
+        key=lambda x: (
+            x["global_samples_seen"],
+            x["epoch"],
+            x["step"],
+            x["mtime"]
+        )
+    )
+
 # -----------------------------------------------------------------------------
 # 2. TRAINING ENGINE
 # -----------------------------------------------------------------------------
-def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, device, 
-                   epoch_idx, acc_steps=1, supcon_fn=None):
+def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, device,
+                   epoch_idx, acc_steps=1, supcon_fn=None,
+                   global_samples_seen=0, next_ckpt_at=None,
+                   periodic_every_samples=None, periodic_ckpt_callback=None):
     model.train()
     
     tracker = {"loss": 0.0, "task_loss": 0.0, "supcon_loss": 0.0}
@@ -124,6 +202,29 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, device,
         tracker["loss"] += current_loss
         tracker["task_loss"] += task_loss.item()
         tracker["supcon_loss"] += supcon_loss.item()
+
+        batch_size_actual = labels.size(0)
+        global_samples_seen += batch_size_actual
+
+        if (
+            periodic_ckpt_callback is not None
+            and periodic_every_samples is not None
+            and periodic_every_samples > 0
+            and next_ckpt_at is not None
+        ):
+            while global_samples_seen >= next_ckpt_at:
+                processed_batches = step + 1
+                running_train_metrics = {
+                    k: (v / processed_batches) for k, v in tracker.items()
+                }
+                periodic_ckpt_callback(
+                    checkpoint_samples=next_ckpt_at,
+                    global_samples_seen=global_samples_seen,
+                    epoch_idx=epoch_idx,
+                    step_idx=step,
+                    running_train_metrics=running_train_metrics
+                )
+                next_ckpt_at += periodic_every_samples
         
         pbar.set_postfix({
             "Loss": f"{current_loss:.3f}",
@@ -131,7 +232,11 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, scaler, device,
         })
 
     num_batches = len(dataloader)
-    return {k: v / num_batches for k, v in tracker.items()}
+    return (
+        {k: v / num_batches for k, v in tracker.items()},
+        global_samples_seen,
+        next_ckpt_at
+    )
 
 # -----------------------------------------------------------------------------
 # 3. MAIN EXECUTION
@@ -158,6 +263,8 @@ if __name__ == "__main__":
     train_cfg = config.get("training", {})
     data_cfg = config.get("data", {})
     model_cfg = config.get("model", {})
+    checkpoint_dir = train_cfg["checkpoint_dir"]
+    auto_resume_latest = train_cfg.get("auto_resume_latest_checkpoint", True)
 
     set_seed(common_cfg.get("seed", 42))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -178,8 +285,23 @@ if __name__ == "__main__":
         except Exception as e:
             logger.warning(f"Comet Init Failed: {e}. Proceeding without it.")
 
-    # 3. Data Loading
-    tokenizer = AutoTokenizer.from_pretrained(model_cfg["base_model"])
+    # 3. Resume Checkpoint Discovery (optional)
+    resume_info = None
+    if auto_resume_latest:
+        resume_info = find_latest_checkpoint(checkpoint_dir)
+        if resume_info:
+            logger.info(
+                f"Auto-resume enabled. Found latest checkpoint: {resume_info['path']} "
+                f"(epoch={resume_info['epoch']}, samples={resume_info['global_samples_seen']})"
+            )
+
+    # 4. Data Loading
+    tokenizer_load_source = model_cfg["base_model"]
+    if resume_info:
+        tokenizer_cfg_path = os.path.join(resume_info["path"], "tokenizer_config.json")
+        if os.path.exists(tokenizer_cfg_path):
+            tokenizer_load_source = resume_info["path"]
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_load_source)
     
     logger.info("Initializing Datasets...")
     train_ds, val_ds = load_data(config, tokenizer)
@@ -200,11 +322,16 @@ if __name__ == "__main__":
         pin_memory=True
     )
 
-    # 4. Model Setup
+    # 5. Model Setup
     model = HybridClassifier(config)
+    if resume_info:
+        weights_path = os.path.join(resume_info["path"], "model_state.bin")
+        logger.info(f"Loading model weights from {weights_path}")
+        state_dict = torch.load(weights_path, map_location="cpu")
+        model.load_state_dict(state_dict, strict=True)
     model.to(device)
     
-    # 5. Optimizer & Scheduler
+    # 6. Optimizer & Scheduler
     optimizer = AdamW(
         filter(lambda p: p.requires_grad, model.parameters()), 
         lr=float(train_cfg["learning_rate"]), 
@@ -228,23 +355,92 @@ if __name__ == "__main__":
         pct_start=0.1
     )
 
-    # 6. Training Loop
+    # 7. Training Loop
     best_f1 = 0.0
+    start_epoch = 0
+    if resume_info:
+        start_epoch = _safe_int(resume_info.get("epoch", 0), 0) + 1
+        resumed_best_f1 = resume_info.get("f1_macro", None)
+        if resumed_best_f1 is not None:
+            try:
+                best_f1 = float(resumed_best_f1)
+            except (TypeError, ValueError):
+                pass
+
     patience = train_cfg.get("early_stop_patience", 3)
     patience_counter = 0
-    checkpoint_dir = train_cfg["checkpoint_dir"]
+    periodic_enabled = train_cfg.get("enable_periodic_checkpoint", True)
+    periodic_every_samples = int(train_cfg.get("periodic_checkpoint_every_samples", 5000))
+    periodic_max_to_keep = train_cfg.get("periodic_checkpoint_max_to_keep", None)
+    if periodic_max_to_keep is not None:
+        periodic_max_to_keep = int(periodic_max_to_keep)
+    if periodic_every_samples <= 0:
+        logger.warning("Invalid periodic_checkpoint_every_samples <= 0. Disabling periodic checkpoints.")
+        periodic_enabled = False
+
+    global_samples_seen = _safe_int(
+        resume_info.get("global_samples_seen", 0), 0
+    ) if resume_info else 0
+    if periodic_enabled:
+        next_ckpt_at = ((global_samples_seen // periodic_every_samples) + 1) * periodic_every_samples
+    else:
+        next_ckpt_at = None
+    periodic_saved_paths = []
     
     label_names = ["Human", "AI"] 
 
-    logger.info(f"Starting Training for {train_cfg['num_epochs']} epochs...")
+    if start_epoch >= train_cfg["num_epochs"]:
+        logger.info(
+            f"Resume checkpoint epoch ({start_epoch}) already reached/exceeded num_epochs "
+            f"({train_cfg['num_epochs']}). Nothing to train."
+        )
+        if experiment:
+            experiment.end()
+        sys.exit(0)
 
-    for epoch in range(train_cfg["num_epochs"]):
+    logger.info(
+        f"Starting Training for {train_cfg['num_epochs']} epochs "
+        f"(start_epoch={start_epoch + 1}, global_samples_seen={global_samples_seen})..."
+    )
+
+    def save_periodic_checkpoint(checkpoint_samples, global_samples_seen, epoch_idx, step_idx, running_train_metrics):
+        periodic_dir = os.path.join(checkpoint_dir, "periodic", f"samples_{checkpoint_samples}")
+        periodic_meta = {
+            "checkpoint_type": "periodic",
+            "epoch": epoch_idx,
+            "step": step_idx,
+            "global_samples_seen": global_samples_seen,
+            "last_train_metrics": running_train_metrics
+        }
+        save_checkpoint(
+            model=model,
+            tokenizer=tokenizer,
+            path=periodic_dir,
+            epoch=epoch_idx,
+            metrics=periodic_meta,
+            config=config
+        )
+        logger.info(f"Periodic checkpoint saved at {checkpoint_samples} samples: {periodic_dir}")
+
+        periodic_saved_paths.append(periodic_dir)
+        if periodic_max_to_keep and periodic_max_to_keep > 0:
+            while len(periodic_saved_paths) > periodic_max_to_keep:
+                old_path = periodic_saved_paths.pop(0)
+                if os.path.exists(old_path):
+                    shutil.rmtree(old_path, ignore_errors=True)
+                    logger.info(f"Removed old periodic checkpoint due to max_to_keep={periodic_max_to_keep}: {old_path}")
+
+    for epoch in range(start_epoch, train_cfg["num_epochs"]):
         ConsoleUX.print_banner(f"Epoch {epoch+1}/{train_cfg['num_epochs']}")
         
         # --- TRAIN ---
-        train_metrics = train_one_epoch(
+        train_metrics, global_samples_seen, next_ckpt_at = train_one_epoch(
             model, train_dl, optimizer, scheduler, scaler, device, 
-            epoch, acc_steps, supcon_fn
+            epoch, acc_steps, supcon_fn,
+            global_samples_seen=global_samples_seen,
+            next_ckpt_at=next_ckpt_at,
+            periodic_every_samples=periodic_every_samples if periodic_enabled else None,
+            periodic_ckpt_callback=save_periodic_checkpoint if periodic_enabled else None
         )
         ConsoleUX.log_metrics("Train", train_metrics)
         
