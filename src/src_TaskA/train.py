@@ -79,6 +79,25 @@ def save_checkpoint(model, tokenizer, path, epoch, metrics, config):
     with open(os.path.join(path, "training_meta.yaml"), "w") as f:
         yaml.dump({"epoch": epoch, "metrics": metrics}, f)
 
+    checkpoint_type = None
+    global_samples_seen = None
+    if isinstance(metrics, dict):
+        checkpoint_type = metrics.get("checkpoint_type", None)
+        global_samples_seen = metrics.get("global_samples_seen", None)
+
+    context_parts = []
+    if checkpoint_type is not None:
+        context_parts.append(f"type={checkpoint_type}")
+    if epoch is not None:
+        context_parts.append(f"epoch={epoch}")
+    if global_samples_seen is not None:
+        context_parts.append(f"global_samples_seen={global_samples_seen}")
+
+    if context_parts:
+        print(f"Checkpoint saved at: {path} | {' | '.join(context_parts)}")
+    else:
+        print(f"Checkpoint saved at: {path}")
+
 def _safe_int(value, default=0):
     try:
         return int(value)
