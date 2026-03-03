@@ -2,6 +2,7 @@ import os
 import sys
 import shutil
 import re
+import json
 import transformers.utils.import_utils
 import transformers.modeling_utils
 
@@ -172,6 +173,65 @@ def find_latest_checkpoint(checkpoint_dir):
         )
     )
 
+
+def _get_parquet_row_count(parquet_path):
+    try:
+        import pyarrow.parquet as pq
+        return int(pq.ParquetFile(parquet_path).metadata.num_rows)
+    except Exception:
+        return None
+
+
+def verify_train_preprocessed_ready(data_dir, expected_train_rows=500000):
+    train_processed_path = os.path.join(data_dir, "train_processed.parquet")
+    done_marker_path = os.path.join(data_dir, "train_processed.done.json")
+
+    if not os.path.exists(train_processed_path):
+        logger.error(
+            f"Missing preprocessed train file: {train_processed_path}. "
+            f"Run preprocess first."
+        )
+        return False
+
+    if not os.path.exists(done_marker_path):
+        logger.error(
+            f"Missing completion marker: {done_marker_path}. "
+            f"Preprocess may still be incomplete."
+        )
+        return False
+
+    try:
+        with open(done_marker_path, "r", encoding="utf-8") as f:
+            marker = json.load(f)
+    except Exception as e:
+        logger.error(f"Cannot read completion marker {done_marker_path}: {e}")
+        return False
+
+    if not marker.get("complete", False):
+        logger.error("train_processed.done.json indicates preprocessing is not complete yet.")
+        return False
+
+    row_count = _get_parquet_row_count(train_processed_path)
+    if row_count is None:
+        logger.error(
+            f"Could not read row count from {train_processed_path}. "
+            f"Please check parquet integrity."
+        )
+        return False
+
+    if expected_train_rows and row_count != expected_train_rows:
+        logger.error(
+            f"train_processed row count mismatch: got {row_count}, expected {expected_train_rows}. "
+            f"Training will not start."
+        )
+        return False
+
+    logger.info(
+        f"Preprocessed train data ready: {train_processed_path} "
+        f"(rows={row_count}, expected={expected_train_rows})"
+    )
+    return True
+
 # -----------------------------------------------------------------------------
 # 2. TRAINING ENGINE
 # -----------------------------------------------------------------------------
@@ -265,6 +325,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="SemEval Task A - Generalization Training")
     parser.add_argument("--config", type=str, default="src/src_TaskA/config/config.yaml")
+    parser.add_argument("--expected-train-rows", type=int, default=500000)
     args = parser.parse_args()
     
     ConsoleUX.print_banner("SemEval Task 13 - Subtask A [Generalization]")
@@ -315,6 +376,12 @@ if __name__ == "__main__":
             )
 
     # 4. Data Loading
+    if not verify_train_preprocessed_ready(
+        data_cfg["data_dir"],
+        expected_train_rows=max(0, int(args.expected_train_rows))
+    ):
+        sys.exit(1)
+
     tokenizer_load_source = model_cfg["base_model"]
     if resume_info:
         tokenizer_cfg_path = os.path.join(resume_info["path"], "tokenizer_config.json")

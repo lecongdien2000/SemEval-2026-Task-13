@@ -2,6 +2,8 @@ import os
 import sys
 import re
 import math
+import json
+import glob
 import yaml
 import torch
 import logging
@@ -223,8 +225,24 @@ class AgnosticFeatureExtractor:
 # -----------------------------------------------------------------------------
 # 4. PROCESSING PIPELINE
 # -----------------------------------------------------------------------------
-def process_data_split(input_path: str, output_path: str, extractor: AgnosticFeatureExtractor):
-    """Processa un singolo file parquet e salva i risultati."""
+def _extract_range_from_chunk_name(chunk_path: str):
+    base = os.path.basename(chunk_path)
+    match = re.search(r"chunk_(\d+)_(\d+)\.parquet$", base)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def process_data_split(
+    input_path: str,
+    output_path: str,
+    extractor: AgnosticFeatureExtractor,
+    split_name: str = "train",
+    checkpoint_every: int = 5000,
+    enable_resume_checkpoints: bool = False,
+    expected_rows: int = None
+):
+    """Processa un file parquet e salva i risultati (con checkpoint/resume opzionale)."""
     if not os.path.exists(input_path):
         logger.warning(f"Input file not found: {input_path}. Skipping.")
         return
@@ -237,34 +255,147 @@ def process_data_split(input_path: str, output_path: str, extractor: AgnosticFea
         logger.error("Column 'code' missing in dataframe.")
         return
 
-    features_list = []
-    
-    # Progress Bar
-    logger.info(f"Extracting features for {len(df)} samples...")
-    for code in tqdm(df['code'], desc="Processing", dynamic_ncols=True):
-        try:
-            feats = extractor.extract_all(code)
-            features_list.append(feats)
-        except Exception as e:
-            logger.warning(f"Error processing snippet: {e}. Using zero-vector.")
-            # Fallback a vettore di zeri lunghezza 11
-            features_list.append([0.0] * 11)
+    total_rows = len(df)
+    if expected_rows is not None and total_rows != expected_rows:
+        logger.warning(
+            f"{split_name}: input rows ({total_rows}) != expected_rows ({expected_rows})."
+        )
 
-    # Aggiunta al DataFrame e Salvataggio
-    df['agnostic_features'] = features_list
-    
-    logger.info(f"Saving processed data to {output_path}...")
-    df.to_parquet(output_path)
-    
-    # Stampa statistiche di controllo
+    # Simple full-pass mode (val/test or when checkpointing disabled)
+    if not enable_resume_checkpoints:
+        features_list = []
+        logger.info(f"Extracting features for {total_rows} samples...")
+        for code in tqdm(df['code'], desc=f"Processing {split_name}", dynamic_ncols=True):
+            try:
+                feats = extractor.extract_all(code)
+                features_list.append(feats)
+            except Exception as e:
+                logger.warning(f"Error processing snippet: {e}. Using zero-vector.")
+                features_list.append([0.0] * 11)
+
+        df['agnostic_features'] = features_list
+        logger.info(f"Saving processed data to {output_path}...")
+        df.to_parquet(output_path, index=False)
+
+        logger.info("Feature names: " + str(extractor.get_feature_names()))
+        sample_feat = np.array(features_list)
+        logger.info(f"Feature Matrix Shape: {sample_feat.shape}")
+        logger.info(f"Avg Perplexity: {np.mean(sample_feat[:, 0]):.4f}")
+        return
+
+    # Checkpoint/resume mode (designed for TRAIN split)
+    checkpoint_dir = os.path.join(os.path.dirname(output_path), "checkpoints", f"{split_name}_chunks")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    progress_path = os.path.join(checkpoint_dir, "progress.json")
+    done_marker_path = os.path.join(os.path.dirname(output_path), f"{split_name}_processed.done.json")
+
+    chunk_glob = os.path.join(checkpoint_dir, f"{split_name}_chunk_*.parquet")
+    existing_chunks = sorted(glob.glob(chunk_glob))
+
+    resume_idx = 0
+    for cpath in existing_chunks:
+        rng = _extract_range_from_chunk_name(cpath)
+        if rng is None:
+            continue
+        _, end = rng
+        resume_idx = max(resume_idx, end)
+
+    logger.info(
+        f"{split_name}: checkpoint mode ON | total_rows={total_rows} | "
+        f"checkpoint_every={checkpoint_every} | resume_idx={resume_idx}"
+    )
+
+    for start in range(resume_idx, total_rows, checkpoint_every):
+        end = min(start + checkpoint_every, total_rows)
+        chunk_df = df.iloc[start:end].copy()
+        chunk_features = []
+
+        logger.info(f"{split_name}: extracting rows [{start}:{end}) ...")
+        for code in tqdm(chunk_df["code"], desc=f"{split_name} {start}:{end}", dynamic_ncols=True):
+            try:
+                feats = extractor.extract_all(code)
+                chunk_features.append(feats)
+            except Exception as e:
+                logger.warning(f"Error processing snippet: {e}. Using zero-vector.")
+                chunk_features.append([0.0] * 11)
+
+        chunk_df["agnostic_features"] = chunk_features
+        chunk_path = os.path.join(
+            checkpoint_dir,
+            f"{split_name}_chunk_{start:07d}_{end:07d}.parquet"
+        )
+        chunk_df.to_parquet(chunk_path, index=False)
+
+        with open(progress_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "split": split_name,
+                    "processed_rows": end,
+                    "total_rows": total_rows,
+                    "checkpoint_every": checkpoint_every,
+                    "latest_chunk": os.path.basename(chunk_path),
+                    "complete": False
+                },
+                f,
+                indent=2
+            )
+        logger.info(f"{split_name}: checkpoint saved -> {chunk_path}")
+
+    final_chunk_paths = sorted(glob.glob(chunk_glob), key=lambda p: _extract_range_from_chunk_name(p) or (0, 0))
+    if not final_chunk_paths:
+        logger.error(f"{split_name}: no checkpoint chunks found in {checkpoint_dir}.")
+        return
+
+    logger.info(f"{split_name}: combining {len(final_chunk_paths)} chunk files into final parquet...")
+    final_df = pd.concat((pd.read_parquet(p) for p in final_chunk_paths), ignore_index=True)
+    final_df = final_df.iloc[:total_rows].copy()
+
+    if len(final_df) != total_rows:
+        logger.error(
+            f"{split_name}: final row count mismatch after combine "
+            f"({len(final_df)} vs expected {total_rows})."
+        )
+        return
+
+    final_df.to_parquet(output_path, index=False)
+
+    feature_matrix = np.array(final_df["agnostic_features"].tolist(), dtype=np.float32)
+    logger.info(f"{split_name}: final processed saved to {output_path}")
     logger.info("Feature names: " + str(extractor.get_feature_names()))
-    sample_feat = np.array(features_list)
-    logger.info(f"Feature Matrix Shape: {sample_feat.shape}")
-    logger.info(f"Avg Perplexity: {np.mean(sample_feat[:, 0]):.4f}")
+    logger.info(f"Feature Matrix Shape: {feature_matrix.shape}")
+    logger.info(f"Avg Perplexity: {np.mean(feature_matrix[:, 0]):.4f}")
+
+    with open(done_marker_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "split": split_name,
+                "complete": True,
+                "total_rows": total_rows,
+                "checkpoint_every": checkpoint_every,
+                "output_path": output_path
+            },
+            f,
+            indent=2
+        )
+
+    with open(progress_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "split": split_name,
+                "processed_rows": total_rows,
+                "total_rows": total_rows,
+                "checkpoint_every": checkpoint_every,
+                "complete": True
+            },
+            f,
+            indent=2
+        )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SemEval Task A - Feature Preprocessing")
     parser.add_argument("--config", type=str, default="src/src_TaskA/config/config.yaml", help="Path to config yaml")
+    parser.add_argument("--checkpoint-every", type=int, default=5000, help="Rows per saved checkpoint chunk for train split")
+    parser.add_argument("--expected-train-rows", type=int, default=500000, help="Expected final train row count")
     args = parser.parse_args()
 
     # 1. Load Config
@@ -295,9 +426,24 @@ if __name__ == "__main__":
     val_output = os.path.join(proc_dir, "val_processed.parquet")
 
     logger.info("--- Starting TRAIN set processing ---")
-    process_data_split(train_input, train_output, extractor)
+    process_data_split(
+        train_input,
+        train_output,
+        extractor,
+        split_name="train",
+        checkpoint_every=max(1, int(args.checkpoint_every)),
+        enable_resume_checkpoints=True,
+        expected_rows=int(args.expected_train_rows) if args.expected_train_rows > 0 else None
+    )
     
     logger.info("--- Starting VAL set processing ---")
-    process_data_split(val_input, val_output, extractor)
+    process_data_split(
+        val_input,
+        val_output,
+        extractor,
+        split_name="val",
+        checkpoint_every=max(1, int(args.checkpoint_every)),
+        enable_resume_checkpoints=False
+    )
     
     logger.info("Preprocessing Completed Successfully.")
