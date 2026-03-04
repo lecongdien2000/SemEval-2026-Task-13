@@ -1,6 +1,5 @@
 import os
 import sys
-import shutil
 import re
 import json
 import transformers.utils.import_utils
@@ -560,23 +559,10 @@ if __name__ == "__main__":
 
     patience = train_cfg.get("early_stop_patience", 3)
     patience_counter = 0
-    periodic_enabled = train_cfg.get("enable_periodic_checkpoint", True)
-    periodic_every_samples = int(train_cfg.get("periodic_checkpoint_every_samples", 5000))
-    periodic_max_to_keep = train_cfg.get("periodic_checkpoint_max_to_keep", None)
-    if periodic_max_to_keep is not None:
-        periodic_max_to_keep = int(periodic_max_to_keep)
-    if periodic_every_samples <= 0:
-        logger.warning("Invalid periodic_checkpoint_every_samples <= 0. Disabling periodic checkpoints.")
-        periodic_enabled = False
-
     global_samples_seen = _safe_int(
         resume_info.get("global_samples_seen", 0), 0
     ) if resume_info else 0
-    if periodic_enabled:
-        next_ckpt_at = ((global_samples_seen // periodic_every_samples) + 1) * periodic_every_samples
-    else:
-        next_ckpt_at = None
-    periodic_saved_paths = []
+    next_ckpt_at = None
     
     label_names = ["Human", "AI"] 
 
@@ -594,33 +580,6 @@ if __name__ == "__main__":
         f"(start_epoch={start_epoch + 1}, global_samples_seen={global_samples_seen})..."
     )
 
-    def save_periodic_checkpoint(checkpoint_samples, global_samples_seen, epoch_idx, step_idx, running_train_metrics):
-        periodic_dir = os.path.join(checkpoint_dir, "periodic", f"samples_{checkpoint_samples}")
-        periodic_meta = {
-            "checkpoint_type": "periodic",
-            "epoch": epoch_idx,
-            "step": step_idx,
-            "global_samples_seen": global_samples_seen,
-            "last_train_metrics": running_train_metrics
-        }
-        save_checkpoint(
-            model=model,
-            tokenizer=tokenizer,
-            path=periodic_dir,
-            epoch=epoch_idx,
-            metrics=periodic_meta,
-            config=config
-        )
-        logger.info(f"Periodic checkpoint saved at {checkpoint_samples} samples: {periodic_dir}")
-
-        periodic_saved_paths.append(periodic_dir)
-        if periodic_max_to_keep and periodic_max_to_keep > 0:
-            while len(periodic_saved_paths) > periodic_max_to_keep:
-                old_path = periodic_saved_paths.pop(0)
-                if os.path.exists(old_path):
-                    shutil.rmtree(old_path, ignore_errors=True)
-                    logger.info(f"Removed old periodic checkpoint due to max_to_keep={periodic_max_to_keep}: {old_path}")
-
     for epoch in range(start_epoch, train_cfg["num_epochs"]):
         ConsoleUX.print_banner(f"Epoch {epoch+1}/{train_cfg['num_epochs']}")
         
@@ -630,8 +589,8 @@ if __name__ == "__main__":
             epoch, acc_steps, supcon_fn,
             global_samples_seen=global_samples_seen,
             next_ckpt_at=next_ckpt_at,
-            periodic_every_samples=periodic_every_samples if periodic_enabled else None,
-            periodic_ckpt_callback=save_periodic_checkpoint if periodic_enabled else None
+            periodic_every_samples=None,
+            periodic_ckpt_callback=None
         )
         ConsoleUX.log_metrics("Train", train_metrics)
         
