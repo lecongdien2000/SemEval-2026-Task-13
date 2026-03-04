@@ -95,9 +95,13 @@ def save_checkpoint(model, tokenizer, path, epoch, metrics, config):
         context_parts.append(f"global_samples_seen={global_samples_seen}")
 
     if context_parts:
-        print(f"Checkpoint saved at: {path} | {' | '.join(context_parts)}")
+        msg = f"Checkpoint saved at: {path} | {' | '.join(context_parts)}"
+        print(msg)
+        logger.info(msg)
     else:
-        print(f"Checkpoint saved at: {path}")
+        msg = f"Checkpoint saved at: {path}"
+        print(msg)
+        logger.info(msg)
 
 def _safe_int(value, default=0):
     try:
@@ -133,6 +137,7 @@ def find_latest_checkpoint(checkpoint_dir):
         step = 0
         global_samples_seen = 0
         f1_macro = None
+        checkpoint_type = None
 
         if os.path.exists(meta_path):
             try:
@@ -145,11 +150,15 @@ def find_latest_checkpoint(checkpoint_dir):
                 )
                 step = _safe_int(metric_obj.get("step", 0), 0)
                 f1_macro = metric_obj.get("f1_macro", None)
+                checkpoint_type = metric_obj.get("checkpoint_type", None)
             except Exception:
                 pass
 
         if global_samples_seen == 0:
             global_samples_seen = _extract_samples_from_path(root)
+
+        if checkpoint_type is None and "epochs" in root.replace("\\", "/").split("/"):
+            checkpoint_type = "epoch_end"
 
         candidates.append({
             "path": root,
@@ -157,11 +166,26 @@ def find_latest_checkpoint(checkpoint_dir):
             "step": step,
             "global_samples_seen": global_samples_seen,
             "f1_macro": f1_macro,
+            "checkpoint_type": checkpoint_type,
             "mtime": os.path.getmtime(model_path)
         })
 
     if not candidates:
         return None
+
+    # Prefer epoch-end checkpoints when available to ensure resume starts
+    # from the most recently completed epoch.
+    epoch_candidates = [c for c in candidates if c.get("checkpoint_type") == "epoch_end"]
+    if epoch_candidates:
+        return max(
+            epoch_candidates,
+            key=lambda x: (
+                x["epoch"],
+                x["step"],
+                x["global_samples_seen"],
+                x["mtime"]
+            )
+        )
 
     return max(
         candidates,
@@ -431,8 +455,16 @@ if __name__ == "__main__":
         if resume_info:
             logger.info(
                 f"Auto-resume enabled. Found latest checkpoint: {resume_info['path']} "
-                f"(epoch={resume_info['epoch']}, samples={resume_info['global_samples_seen']})"
+                f"(type={resume_info.get('checkpoint_type')}, "
+                f"epoch={resume_info['epoch']}, samples={resume_info['global_samples_seen']})"
             )
+        else:
+            logger.info(
+                f"Auto-resume enabled, but no checkpoint found in: {checkpoint_dir}. "
+                "Training will start from scratch."
+            )
+    else:
+        logger.info("Auto-resume disabled. Training will start from scratch.")
 
     # 4. Data Loading
     if not verify_train_preprocessed_ready(
@@ -475,9 +507,13 @@ if __name__ == "__main__":
     model = HybridClassifier(config)
     if resume_info:
         weights_path = os.path.join(resume_info["path"], "model_state.bin")
-        logger.info(f"Loading model weights from {weights_path}")
+        logger.info(
+            f"Loading most recent checkpoint weights from {weights_path} "
+            f"(type={resume_info.get('checkpoint_type')}, epoch={resume_info.get('epoch')})"
+        )
         state_dict = torch.load(weights_path, map_location="cpu")
         model.load_state_dict(state_dict, strict=True)
+        logger.info("Checkpoint weights loaded successfully.")
     model.to(device)
     
     # 6. Optimizer & Scheduler
@@ -515,6 +551,12 @@ if __name__ == "__main__":
                 best_f1 = float(resumed_best_f1)
             except (TypeError, ValueError):
                 pass
+        logger.info(
+            f"Resume status: checkpoint epoch={resume_info.get('epoch')} loaded, "
+            f"training will continue from epoch={start_epoch + 1}."
+        )
+    else:
+        logger.info("Resume status: no checkpoint loaded, starting from epoch=1.")
 
     patience = train_cfg.get("early_stop_patience", 3)
     patience_counter = 0
@@ -605,6 +647,22 @@ if __name__ == "__main__":
         
         if experiment:
             experiment.log_metrics(val_metrics, prefix="Val", step=epoch)
+
+        # Save checkpoint at the end of every epoch (resume source of truth).
+        epoch_dir = os.path.join(checkpoint_dir, "epochs", f"epoch_{epoch + 1:03d}")
+        epoch_meta = dict(val_metrics)
+        epoch_meta["checkpoint_type"] = "epoch_end"
+        epoch_meta["global_samples_seen"] = global_samples_seen
+        epoch_meta["step"] = len(train_dl)
+        epoch_meta["train_metrics"] = train_metrics
+        save_checkpoint(
+            model=model,
+            tokenizer=tokenizer,
+            path=epoch_dir,
+            epoch=epoch,
+            metrics=epoch_meta,
+            config=config
+        )
 
         # --- CHECKPOINTING ---
         current_f1 = val_metrics["f1_macro"]
