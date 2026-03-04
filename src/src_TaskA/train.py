@@ -232,6 +232,64 @@ def verify_train_preprocessed_ready(data_dir, expected_train_rows=500000):
     )
     return True
 
+
+def _infer_root_project_path():
+    """
+    Prefer the workspace root (parent of repo root) when it contains a `data` folder.
+    Fallback to repo root.
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))  # .../SemEval-2026-Task-13/src/src_TaskA
+    repo_root = os.path.abspath(os.path.join(script_dir, "..", ".."))  # .../SemEval-2026-Task-13
+    workspace_root = os.path.abspath(os.path.join(repo_root, ".."))  # .../advanced ml kaggle
+
+    if os.path.isdir(os.path.join(workspace_root, "data")):
+        return workspace_root
+    return repo_root
+
+
+def resolve_data_dir(configured_data_dir):
+    """
+    Resolve relative data_dir from:
+    1) ROOT_PROJECT_PATH env (if provided)
+    2) inferred root project path
+    3) current working directory (fallback)
+    """
+    if not configured_data_dir:
+        return configured_data_dir
+
+    if os.path.isabs(configured_data_dir):
+        return configured_data_dir
+
+    root_from_env = os.getenv("ROOT_PROJECT_PATH", "").strip()
+    inferred_root = _infer_root_project_path()
+    roots = []
+    if root_from_env:
+        roots.append(root_from_env)
+    roots.extend([inferred_root, os.getcwd()])
+
+    seen = set()
+    candidates = []
+    for root in roots:
+        if not root:
+            continue
+        root_abs = os.path.abspath(root)
+        if root_abs in seen:
+            continue
+        seen.add(root_abs)
+        candidate = os.path.abspath(os.path.join(root_abs, configured_data_dir))
+        candidates.append(candidate)
+        if os.path.isdir(candidate):
+            if (
+                os.path.exists(os.path.join(candidate, "train_processed.parquet"))
+                or os.path.exists(os.path.join(candidate, "train_processed.done.json"))
+            ):
+                logger.info(f"Resolved data_dir: {candidate}")
+                return candidate
+
+    default_candidate = candidates[0] if candidates else configured_data_dir
+    logger.info(f"Resolved data_dir (default): {default_candidate}")
+    return default_candidate
+
 # -----------------------------------------------------------------------------
 # 2. TRAINING ENGINE
 # -----------------------------------------------------------------------------
@@ -343,6 +401,7 @@ if __name__ == "__main__":
     train_cfg = config.get("training", {})
     data_cfg = config.get("data", {})
     model_cfg = config.get("model", {})
+    data_cfg["data_dir"] = resolve_data_dir(data_cfg.get("data_dir", "data/Task_A_Processed"))
     checkpoint_dir = train_cfg["checkpoint_dir"]
     auto_resume_latest = train_cfg.get("auto_resume_latest_checkpoint", True)
 
@@ -381,6 +440,10 @@ if __name__ == "__main__":
         expected_train_rows=max(0, int(args.expected_train_rows))
     ):
         sys.exit(1)
+    logger.info(
+        f"Loaded preprocessed data successfully from: {data_cfg['data_dir']} "
+        "-> training will start."
+    )
 
     tokenizer_load_source = model_cfg["base_model"]
     if resume_info:
