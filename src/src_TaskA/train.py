@@ -607,8 +607,8 @@ if __name__ == "__main__":
         if experiment:
             experiment.log_metrics(val_metrics, prefix="Val", step=epoch)
 
-        # Save checkpoint at the end of every epoch (resume source of truth).
-        epoch_dir = os.path.join(checkpoint_dir, "epochs", f"epoch_{epoch + 1:03d}")
+        # Save only one rolling epoch-end checkpoint (overwrite each epoch).
+        epoch_dir = os.path.join(checkpoint_dir, "latest_epoch")
         epoch_meta = dict(val_metrics)
         epoch_meta["checkpoint_type"] = "epoch_end"
         epoch_meta["global_samples_seen"] = global_samples_seen
