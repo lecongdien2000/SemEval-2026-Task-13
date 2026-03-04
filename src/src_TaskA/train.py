@@ -609,6 +609,14 @@ if __name__ == "__main__":
 
         # Save only one rolling epoch-end checkpoint (overwrite each epoch).
         epoch_dir = os.path.join(checkpoint_dir, "latest_epoch")
+        latest_model_path = os.path.join(epoch_dir, "model_state.bin")
+        if os.path.exists(latest_model_path):
+            logger.info(
+                f"Overwriting latest epoch checkpoint at: {epoch_dir} "
+                f"with epoch {epoch + 1}."
+            )
+        else:
+            logger.info(f"Saving first latest epoch checkpoint at: {epoch_dir}")
         epoch_meta = dict(val_metrics)
         epoch_meta["checkpoint_type"] = "epoch_end"
         epoch_meta["global_samples_seen"] = global_samples_seen
