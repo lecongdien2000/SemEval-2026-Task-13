@@ -233,6 +233,46 @@ def _extract_range_from_chunk_name(chunk_path: str):
     return int(match.group(1)), int(match.group(2))
 
 
+def _get_parquet_row_count(parquet_path: str):
+    try:
+        import pyarrow.parquet as pq
+        return int(pq.ParquetFile(parquet_path).metadata.num_rows)
+    except Exception:
+        return None
+
+
+def _is_split_already_processed(
+    output_path: str,
+    split_name: str,
+    expected_rows: int = None,
+    require_done_marker: bool = False
+):
+    if not os.path.exists(output_path):
+        return False
+
+    if require_done_marker:
+        done_marker_path = os.path.join(
+            os.path.dirname(output_path),
+            f"{split_name}_processed.done.json"
+        )
+        if not os.path.exists(done_marker_path):
+            return False
+        try:
+            with open(done_marker_path, "r", encoding="utf-8") as f:
+                marker = json.load(f)
+            if not marker.get("complete", False):
+                return False
+        except Exception:
+            return False
+
+    if expected_rows is not None and expected_rows > 0:
+        row_count = _get_parquet_row_count(output_path)
+        if row_count != int(expected_rows):
+            return False
+
+    return True
+
+
 def process_data_split(
     input_path: str,
     output_path: str,
@@ -424,26 +464,56 @@ if __name__ == "__main__":
     
     train_output = os.path.join(proc_dir, "train_processed.parquet")
     val_output = os.path.join(proc_dir, "val_processed.parquet")
+    expected_train_rows = int(args.expected_train_rows) if args.expected_train_rows > 0 else None
 
-    logger.info("--- Starting TRAIN set processing ---")
-    process_data_split(
-        train_input,
-        train_output,
-        extractor,
+    train_already_done = _is_split_already_processed(
+        output_path=train_output,
         split_name="train",
-        checkpoint_every=max(1, int(args.checkpoint_every)),
-        enable_resume_checkpoints=True,
-        expected_rows=int(args.expected_train_rows) if args.expected_train_rows > 0 else None
+        expected_rows=expected_train_rows,
+        require_done_marker=True
     )
-    
-    logger.info("--- Starting VAL set processing ---")
-    process_data_split(
-        val_input,
-        val_output,
-        extractor,
+    val_already_done = _is_split_already_processed(
+        output_path=val_output,
         split_name="val",
-        checkpoint_every=max(1, int(args.checkpoint_every)),
-        enable_resume_checkpoints=False
+        expected_rows=None,
+        require_done_marker=False
     )
+
+    if train_already_done and val_already_done:
+        logger.info(
+            "Preprocessed outputs already exist and are valid. "
+            "Skipping preprocessing."
+        )
+        logger.info(f"Using existing train file: {train_output}")
+        logger.info(f"Using existing val file: {val_output}")
+        logger.info("Preprocessing Completed Successfully.")
+        sys.exit(0)
+
+    if train_already_done:
+        logger.info(f"Train preprocessed file already ready. Skipping: {train_output}")
+    else:
+        logger.info("--- Starting TRAIN set processing ---")
+        process_data_split(
+            train_input,
+            train_output,
+            extractor,
+            split_name="train",
+            checkpoint_every=max(1, int(args.checkpoint_every)),
+            enable_resume_checkpoints=True,
+            expected_rows=expected_train_rows
+        )
+    
+    if val_already_done:
+        logger.info(f"Val preprocessed file already ready. Skipping: {val_output}")
+    else:
+        logger.info("--- Starting VAL set processing ---")
+        process_data_split(
+            val_input,
+            val_output,
+            extractor,
+            split_name="val",
+            checkpoint_every=max(1, int(args.checkpoint_every)),
+            enable_resume_checkpoints=False
+        )
     
     logger.info("Preprocessing Completed Successfully.")
