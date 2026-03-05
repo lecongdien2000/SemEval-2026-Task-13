@@ -8,6 +8,7 @@ import numpy as np
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
 from torch.amp import autocast
+from transformers import AutoTokenizer
 from dotenv import load_dotenv
 
 try:
@@ -38,11 +39,19 @@ logger = logging.getLogger(__name__)
 # 1. DATASET SPECIFICO PER SUBMISSION
 # -----------------------------------------------------------------------------
 class SubmissionDataset(Dataset):
-    def __init__(self, dataframe: pd.DataFrame, tokenizer, max_length: int = 512, id_col: str = "id"):
+    def __init__(
+        self,
+        dataframe: pd.DataFrame,
+        tokenizer,
+        max_length: int = 512,
+        id_col: str = "id",
+        feature_dim: int = 11
+    ):
         self.data = dataframe.reset_index(drop=True)
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.id_col = id_col
+        self.feature_dim = int(feature_dim)
         
         self.lang_map = {'c#': 0, 'c++': 1, 'go': 2, 'java': 3, 'javascript': 4, 'php': 5, 'python': 6, 'unknown': 7}
         
@@ -77,7 +86,13 @@ class SubmissionDataset(Dataset):
             return_tensors="pt"
         )
 
-        stylo = self.stylo_extractor.extract(code) if self.stylo_extractor else np.zeros(13, dtype=np.float32)
+        stylo = self.stylo_extractor.extract(code) if self.stylo_extractor else np.zeros(self.feature_dim, dtype=np.float32)
+        stylo = np.asarray(stylo, dtype=np.float32).reshape(-1)
+        if stylo.shape[0] != self.feature_dim:
+            fixed = np.zeros(self.feature_dim, dtype=np.float32)
+            copy_len = min(self.feature_dim, stylo.shape[0])
+            fixed[:copy_len] = stylo[:copy_len]
+            stylo = fixed
 
         return {
             "id": row_id,
@@ -96,29 +111,45 @@ def load_model_for_submission(config_path: str, checkpoint_dir: str, device: tor
 
     logger.info("Initializing HybridClassifier (previously FusionCodeClassifier)...")
     model = HybridClassifier(config)
-    
-    checkpoint_path = os.path.join(checkpoint_dir, "best_model.pt")
+
+    actual_checkpoint_dir = checkpoint_dir
+    best_model_dir = os.path.join(checkpoint_dir, "best_model")
+    if os.path.exists(best_model_dir):
+        actual_checkpoint_dir = best_model_dir
+
+    checkpoint_path = os.path.join(actual_checkpoint_dir, "model_state.bin")
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
 
+    tokenizer = AutoTokenizer.from_pretrained(actual_checkpoint_dir)
+
     logger.info(f"Loading weights from {checkpoint_path}")
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device), strict=False)
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device), strict=True)
     model.to(device)
     model.eval()
-    return model
+    return model, tokenizer, config
 
 # -----------------------------------------------------------------------------
 # 3. Inference Loop
 # -----------------------------------------------------------------------------
 def run_inference_pipeline(
     model: HybridClassifier, 
+    tokenizer,
+    config,
     test_df: pd.DataFrame, 
     id_col_name: str,
     output_file: str, 
     device: torch.device,
     batch_size: int = 64
 ):
-    dataset = SubmissionDataset(test_df, model.tokenizer, max_length=512, id_col=id_col_name)
+    feature_dim = config.get("data", {}).get("num_handcrafted_features", 11)
+    dataset = SubmissionDataset(
+        test_df,
+        tokenizer,
+        max_length=config.get("data", {}).get("max_length", 512),
+        id_col=id_col_name,
+        feature_dim=feature_dim
+    )
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
     ids = []
@@ -134,8 +165,8 @@ def run_inference_pipeline(
             attention_mask = batch["attention_mask"].to(device)
             stylo_feats = batch["stylo_feats"].to(device)
             
-            with autocast('cuda', dtype=torch.float16):
-                logits, _ = model(input_ids, attention_mask, stylo_feats)
+            with autocast(device_type='cuda', dtype=torch.float16):
+                logits, _, _ = model(input_ids, attention_mask, stylo_feats)
                 
             probs = torch.softmax(logits, dim=1)[:, 1]
             preds = (probs >= THRESHOLD).long().cpu().tolist()
@@ -175,7 +206,7 @@ def main():
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     
     config_path = "src/src_TaskA/config/config.yaml"
-    checkpoint_dir = "results/results_TaskA/checkpoints"
+    checkpoint_dir = "results/result_TaskA/checkpoints"
     
     # --- GESTIONE PERCORSO FILE TEST ---
     if len(sys.argv) > 1:
@@ -192,7 +223,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    model = load_model_for_submission(config_path, checkpoint_dir, device)
+    model, tokenizer, config = load_model_for_submission(config_path, checkpoint_dir, device)
 
     logger.info(f"Reading test data from {test_path}...")
     try:
@@ -228,10 +259,10 @@ def main():
         # Normalizziamo il nome per il dataset
         df = df.rename(columns={lang_col: "language"})
 
-    output_file = "results/results_TaskA/submission/submission_task_a.csv"
+    output_file = "results/result_TaskA/submission/submission_task_a.csv"
     
     # Passiamo il nome della colonna ID trovata
-    run_inference_pipeline(model, df, id_col, output_file, device)
+    run_inference_pipeline(model, tokenizer, config, df, id_col, output_file, device)
 
 if __name__ == "__main__":
     main()
