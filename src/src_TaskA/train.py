@@ -112,17 +112,9 @@ def _extract_samples_from_path(path):
     match = re.search(r"samples_(\d+)", path.replace("\\", "/"))
     return _safe_int(match.group(1), 0) if match else 0
 
-def find_latest_checkpoint(checkpoint_dir):
-    """
-    Finds the latest checkpoint available in checkpoint_dir recursively.
-    Ranking priority:
-    1) global_samples_seen (if available)
-    2) epoch
-    3) step
-    4) file mtime
-    """
+def _collect_checkpoint_candidates(checkpoint_dir):
     if not os.path.exists(checkpoint_dir):
-        return None
+        return []
 
     candidates = []
     for root, _, files in os.walk(checkpoint_dir):
@@ -168,12 +160,14 @@ def find_latest_checkpoint(checkpoint_dir):
             "checkpoint_type": checkpoint_type,
             "mtime": os.path.getmtime(model_path)
         })
+    return candidates
 
+
+def _select_latest_checkpoint(candidates):
     if not candidates:
         return None
 
-    # Prefer epoch-end checkpoints when available to ensure resume starts
-    # from the most recently completed epoch.
+    # Prefer epoch-end checkpoints to resume from last completed epoch.
     epoch_candidates = [c for c in candidates if c.get("checkpoint_type") == "epoch_end"]
     if epoch_candidates:
         return max(
@@ -195,6 +189,48 @@ def find_latest_checkpoint(checkpoint_dir):
             x["mtime"]
         )
     )
+
+def _format_checkpoint_info(ckpt):
+    return (
+        f"path={ckpt.get('path')} | type={ckpt.get('checkpoint_type')} | "
+        f"epoch={ckpt.get('epoch')} | step={ckpt.get('step')} | "
+        f"samples={ckpt.get('global_samples_seen')} | "
+        f"f1_macro={ckpt.get('f1_macro')} | mtime={ckpt.get('mtime')}"
+    )
+
+def log_checkpoint_scan(checkpoint_dir, candidates, selected):
+    logger.info(f"Checkpoint scan path: {checkpoint_dir}")
+    logger.info(f"Checkpoint candidates found: {len(candidates)}")
+    if not candidates:
+        return
+
+    sorted_candidates = sorted(
+        candidates,
+        key=lambda x: (
+            1 if x.get("checkpoint_type") == "epoch_end" else 0,
+            _safe_int(x.get("epoch"), 0),
+            _safe_int(x.get("step"), 0),
+            _safe_int(x.get("global_samples_seen"), 0),
+            float(x.get("mtime", 0.0))
+        ),
+        reverse=True
+    )
+
+    for idx, ckpt in enumerate(sorted_candidates, start=1):
+        logger.info(f"[Checkpoint Candidate {idx}] {_format_checkpoint_info(ckpt)}")
+
+    if selected:
+        logger.info(f"[Checkpoint Selected] {_format_checkpoint_info(selected)}")
+
+def find_latest_checkpoint(checkpoint_dir):
+    """
+    Finds the latest checkpoint available in checkpoint_dir recursively.
+    Ranking priority:
+    1) epoch_end checkpoint by epoch/step/samples/mtime
+    2) fallback by samples/epoch/step/mtime
+    """
+    candidates = _collect_checkpoint_candidates(checkpoint_dir)
+    return _select_latest_checkpoint(candidates)
 
 
 def _get_parquet_row_count(parquet_path):
@@ -450,12 +486,15 @@ if __name__ == "__main__":
     # 3. Resume Checkpoint Discovery (optional)
     resume_info = None
     if auto_resume_latest:
-        resume_info = find_latest_checkpoint(checkpoint_dir)
+        ckpt_candidates = _collect_checkpoint_candidates(checkpoint_dir)
+        resume_info = _select_latest_checkpoint(ckpt_candidates)
+        log_checkpoint_scan(checkpoint_dir, ckpt_candidates, resume_info)
         if resume_info:
             logger.info(
                 f"Auto-resume enabled. Found latest checkpoint: {resume_info['path']} "
                 f"(type={resume_info.get('checkpoint_type')}, "
-                f"epoch={resume_info['epoch']}, samples={resume_info['global_samples_seen']})"
+                f"epoch={resume_info['epoch']}, step={resume_info.get('step')}, "
+                f"samples={resume_info['global_samples_seen']}, f1_macro={resume_info.get('f1_macro')})"
             )
         else:
             logger.info(
@@ -481,6 +520,13 @@ if __name__ == "__main__":
         tokenizer_cfg_path = os.path.join(resume_info["path"], "tokenizer_config.json")
         if os.path.exists(tokenizer_cfg_path):
             tokenizer_load_source = resume_info["path"]
+            logger.info(f"Tokenizer resume source found: {tokenizer_cfg_path}")
+        else:
+            logger.info(
+                f"Tokenizer not found in checkpoint path ({tokenizer_cfg_path}). "
+                f"Falling back to base model tokenizer: {tokenizer_load_source}"
+            )
+    logger.info(f"Loading tokenizer from: {tokenizer_load_source}")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_load_source)
     
     logger.info("Initializing Datasets...")
@@ -506,10 +552,13 @@ if __name__ == "__main__":
     model = HybridClassifier(config)
     if resume_info:
         weights_path = os.path.join(resume_info["path"], "model_state.bin")
+        meta_path = os.path.join(resume_info["path"], "training_meta.yaml")
         logger.info(
             f"Loading most recent checkpoint weights from {weights_path} "
-            f"(type={resume_info.get('checkpoint_type')}, epoch={resume_info.get('epoch')})"
+            f"(type={resume_info.get('checkpoint_type')}, epoch={resume_info.get('epoch')}, "
+            f"step={resume_info.get('step')}, samples={resume_info.get('global_samples_seen')})"
         )
+        logger.info(f"Checkpoint metadata path: {meta_path}")
         state_dict = torch.load(weights_path, map_location="cpu")
         model.load_state_dict(state_dict, strict=True)
         logger.info("Checkpoint weights loaded successfully.")
@@ -551,8 +600,10 @@ if __name__ == "__main__":
             except (TypeError, ValueError):
                 pass
         logger.info(
-            f"Resume status: checkpoint epoch={resume_info.get('epoch')} loaded, "
-            f"training will continue from epoch={start_epoch + 1}."
+            f"Resume status: loaded checkpoint path={resume_info.get('path')} | "
+            f"type={resume_info.get('checkpoint_type')} | epoch={resume_info.get('epoch')} | "
+            f"step={resume_info.get('step')} | samples={resume_info.get('global_samples_seen')} | "
+            f"best_f1={best_f1}. Next epoch to run: {start_epoch + 1}."
         )
     else:
         logger.info("Resume status: no checkpoint loaded, starting from epoch=1.")
