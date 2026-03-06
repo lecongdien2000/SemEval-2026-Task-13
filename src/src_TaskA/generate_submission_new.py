@@ -67,21 +67,28 @@ def prepare_test_data(test_path, config, device):
     gdrive_test_processed = os.path.join(gdrive_data_dir, "test_processed.parquet")
     gdrive_test_preprocessed = os.path.join(gdrive_data_dir, "test_preprocessed.parquet")
 
+    def _load_test_data(path):
+        """Load test data and add dummy label if missing (required for inference)."""
+        df = pd.read_parquet(path)
+        if 'label' not in df.columns:
+            df['label'] = 0
+        return df
+
     if os.path.exists(cache_path):
         logger.info(f"Found cached processed file: {cache_path}")
-        return pd.read_parquet(cache_path)
+        return _load_test_data(cache_path)
     elif os.path.exists(original_cache_path):
         logger.info(f"Found cached processed file: {original_cache_path}")
-        return pd.read_parquet(original_cache_path)
+        return _load_test_data(original_cache_path)
     elif os.path.exists(test_processed_path):
         logger.info(f"Found pre-downloaded test_processed.parquet: {test_processed_path}")
-        return pd.read_parquet(test_processed_path)
+        return _load_test_data(test_processed_path)
     elif os.path.exists(gdrive_test_processed):
         logger.info(f"Found pre-downloaded test_processed.parquet: {gdrive_test_processed}")
-        return pd.read_parquet(gdrive_test_processed)
+        return _load_test_data(gdrive_test_processed)
     elif os.path.exists(gdrive_test_preprocessed):
         logger.info(f"Found pre-downloaded test_preprocessed.parquet: {gdrive_test_preprocessed}")
-        return pd.read_parquet(gdrive_test_preprocessed)
+        return _load_test_data(gdrive_test_preprocessed)
 
     extractor = AgnosticFeatureExtractor(config, str(device))
     
@@ -97,7 +104,11 @@ def prepare_test_data(test_path, config, device):
             features_list.append([0.0] * 11)
             
     df['agnostic_features'] = features_list
-    
+
+    # Add dummy label column for inference (required by dataset)
+    if 'label' not in df.columns:
+        df['label'] = 0
+
     logger.info(f"Saving processed test data to {cache_path}")
     df.to_parquet(cache_path)
     
