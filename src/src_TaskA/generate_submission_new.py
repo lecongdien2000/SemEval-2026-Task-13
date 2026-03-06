@@ -62,6 +62,11 @@ def prepare_test_data(test_path, config, device):
     data_dir = os.path.dirname(test_path)
     test_processed_path = os.path.join(data_dir, "test_processed.parquet")
 
+    # Also check in the Google Drive downloaded data directory (same as train_processed and val_processed)
+    gdrive_data_dir = "/kaggle/working/SemEval-2026-Task-13/data/Task_A_Processed"
+    gdrive_test_processed = os.path.join(gdrive_data_dir, "test_processed.parquet")
+    gdrive_test_preprocessed = os.path.join(gdrive_data_dir, "test_preprocessed.parquet")
+
     if os.path.exists(cache_path):
         logger.info(f"Found cached processed file: {cache_path}")
         return pd.read_parquet(cache_path)
@@ -71,6 +76,12 @@ def prepare_test_data(test_path, config, device):
     elif os.path.exists(test_processed_path):
         logger.info(f"Found pre-downloaded test_processed.parquet: {test_processed_path}")
         return pd.read_parquet(test_processed_path)
+    elif os.path.exists(gdrive_test_processed):
+        logger.info(f"Found pre-downloaded test_processed.parquet: {gdrive_test_processed}")
+        return pd.read_parquet(gdrive_test_processed)
+    elif os.path.exists(gdrive_test_preprocessed):
+        logger.info(f"Found pre-downloaded test_preprocessed.parquet: {gdrive_test_preprocessed}")
+        return pd.read_parquet(gdrive_test_preprocessed)
 
     extractor = AgnosticFeatureExtractor(config, str(device))
     
