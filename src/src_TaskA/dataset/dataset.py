@@ -42,15 +42,24 @@ class AgnosticDataset(Dataset):
         idx 1: Avg ID Len (Unbounded -> Log)
         idx 7: Line Len Std (Unbounded -> Log)
         Altri: Ratio 0-1 (Keep as is)
+
+        IMPORTANT: Handles NaN and Inf values to prevent loss = NaN
         """
         x = feature_vector.clone()
-        
-        indices_to_log = [0, 1, 7] 
-        
+
+        # FIX: Handle NaN/Inf values BEFORE any computation
+        # Replace NaN with 0, Inf with a large positive value
+        x = torch.nan_to_num(x, nan=0.0, posinf=100.0, neginf=0.0)
+
+        # Ensure non-negative values before log transform
+        x = torch.clamp(x, min=0.0)
+
+        indices_to_log = [0, 1, 7]
+
         for i in indices_to_log:
             if i < x.shape[0]:
                 x[i] = torch.log1p(x[i])
-        
+
         x = torch.clamp(x, min=0.0, max=100.0)
         return x
 

@@ -34,21 +34,45 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def prepare_test_data(test_path, config, device):
+def prepare_test_data(test_path, config, device, force_reextract=False):
     """
     Prepares test data by checking if features are present.
     If not, extracts them using AgnosticFeatureExtractor.
     Caches processed data in current working directory (handles read-only /kaggle/input).
     Also checks for pre-downloaded test_processed.parquet in data directory.
+
+    Args:
+        test_path: Path to the test parquet file
+        config: Configuration dictionary
+        device: Device to use for feature extraction
+        force_reextract: If True, always re-extract features even if present
     """
     logger.info(f"Loading test data: {test_path}")
     df = pd.read_parquet(test_path)
 
-    if 'agnostic_features' in df.columns:
-        logger.info("Features already present in dataset.")
-        return df
+    def _has_valid_features(df):
+        """Check if the dataframe has valid (non-zero) features."""
+        if 'agnostic_features' not in df.columns:
+            return False
+        try:
+            feats = np.array(df['agnostic_features'].tolist())
+            # Check if more than 50% of rows have all zeros (extraction likely failed)
+            zero_rows = (feats == 0).all(axis=1).mean()
+            if zero_rows > 0.5:
+                logger.warning(f"Features appear invalid: {zero_rows*100:.1f}% of rows have all zeros")
+                return False
+            return True
+        except Exception:
+            return False
 
-    logger.info("Features missing. Initializing Feature Extractor (this may take a while)...")
+    if 'agnostic_features' in df.columns and not force_reextract:
+        if _has_valid_features(df):
+            logger.info("Features already present and valid in dataset.")
+            return df
+        else:
+            logger.warning("Features present but appear invalid. Re-extracting...")
+
+    logger.info("Features missing or invalid. Initializing Feature Extractor (this may take a while)...")
 
     # Save cache to current working directory instead of input directory (handles read-only /kaggle/input)
     test_filename = os.path.basename(test_path)
@@ -140,9 +164,50 @@ def generate_submission(args):
     logger.info(f"Configuration loaded from {config_path}")
 
     # 2. Prepare Test Data (extract features if needed)
-    test_df = prepare_test_data(args.test_file, config, device)
+    test_df = prepare_test_data(args.test_file, config, device, force_reextract=args.force_reextract)
     logger.info(f"Test data loaded: {len(test_df)} samples")
-    
+
+    # DEBUG: Check raw features in test data
+    print("\n" + "="*60)
+    print("RAW TEST DATA FEATURES (Debug)".center(60))
+    print("="*60)
+    test_has_valid_features = False
+    if 'agnostic_features' in test_df.columns:
+        raw_feats = np.array(test_df['agnostic_features'].tolist())
+        print(f"Feature matrix shape: {raw_feats.shape}")
+        print(f"Perplexity (idx 0)  - Mean: {raw_feats[:, 0].mean():.4f}, Std: {raw_feats[:, 0].std():.4f}")
+        print(f"  Zero count: {(raw_feats[:, 0] == 0).sum()} / {len(raw_feats[:, 0])}")
+        print(f"ID Len Avg (idx 1)  - Mean: {raw_feats[:, 1].mean():.4f}, Std: {raw_feats[:, 1].std():.4f}")
+        print(f"Style Consistency    - Mean: {raw_feats[:, 5].mean():.4f}, Std: {raw_feats[:, 5].std():.4f}") if raw_feats.shape[1] > 5 else None
+        print(f"Line Len Std (idx 7)- Mean: {raw_feats[:, 7].mean():.4f}, Std: {raw_feats[:, 7].std():.4f}") if raw_feats.shape[1] > 7 else None
+
+        # Check if features are mostly zeros (indicates extraction failure)
+        zero_ratio = (raw_feats == 0).all(axis=1).mean()
+        print(f"\nRows with ALL zeros: {zero_ratio*100:.1f}%")
+        if zero_ratio > 0.5:
+            print("WARNING: >50% of test samples have zero features! Feature extraction likely failed.")
+        test_has_valid_features = zero_ratio < 0.5
+    else:
+        print("WARNING: No 'agnostic_features' column found in test data!")
+    print("="*60 + "\n")
+
+    # Try to load training data for comparison (if available)
+    train_data_path = config["data"].get("data_dir", "data/Task_A_Processed")
+    train_file = os.path.join(train_data_path, "train_processed.parquet")
+    if os.path.exists(train_file):
+        print("\n" + "="*60)
+        print("TRAIN DATA FEATURES (for comparison)".center(60))
+        print("="*60)
+        train_df_debug = pd.read_parquet(train_file)
+        if 'agnostic_features' in train_df_debug.columns:
+            train_feats = np.array(train_df_debug['agnostic_features'].tolist())
+            print(f"Feature matrix shape: {train_feats.shape}")
+            print(f"Perplexity (idx 0)  - Mean: {train_feats[:, 0].mean():.4f}, Std: {train_feats[:, 0].std():.4f}")
+            print(f"ID Len Avg (idx 1)  - Mean: {train_feats[:, 1].mean():.4f}, Std: {train_feats[:, 1].std():.4f}")
+            print(f"Style Consistency    - Mean: {train_feats[:, 5].mean():.4f}, Std: {train_feats[:, 5].std():.4f}") if train_feats.shape[1] > 5 else None
+            print(f"Line Len Std (idx 7)- Mean: {train_feats[:, 7].mean():.4f}, Std: {train_feats[:, 7].std():.4f}") if train_feats.shape[1] > 7 else None
+        print("="*60 + "\n")
+
     # Ensure 'id' column exists
     if 'id' not in test_df.columns and 'ID' not in test_df.columns:
         # If no ID column, use the index
@@ -196,22 +261,61 @@ def generate_submission(args):
     all_probabilities = []
     all_ids = []
 
+    # DEBUG: Track feature statistics
+    feature_stats = {
+        'perplexity': [],
+        'id_len_avg': [],
+        'style_consistency': [],
+        'line_len_std': []
+    }
+
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Generating predictions"):
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             feats = batch["extra_features"].to(device, non_blocking=True)
-            
+
+            # DEBUG: Collect feature statistics before model inference
+            feature_stats['perplexity'].extend(feats[:, 0].cpu().numpy().tolist())
+            feature_stats['id_len_avg'].extend(feats[:, 1].cpu().numpy().tolist())
+            feature_stats['style_consistency'].extend(feats[:, 5].cpu().numpy().tolist() if feats.shape[1] > 5 else [])
+            feature_stats['line_len_std'].extend(feats[:, 7].cpu().numpy().tolist() if feats.shape[1] > 7 else [])
+
             # Forward pass
             logits, _, _ = model(input_ids, attention_mask, feats, labels=None)
             probs = torch.softmax(logits, dim=1)
             preds = torch.argmax(logits, dim=1)
-            
+
             all_predictions.extend(preds.cpu().numpy().tolist())
             all_probabilities.extend(probs.cpu().numpy().tolist())
             # all_ids.extend(batch["id"])  # This should be a list of string IDs
 
     logger.info(f"Inference complete. Generated {len(all_predictions)} predictions.")
+
+    # DEBUG: Print feature statistics
+    print("\n" + "="*60)
+    print("FEATURE STATISTICS (Debug)".center(60))
+    print("="*60)
+    if feature_stats['perplexity']:
+        ppl_arr = np.array(feature_stats['perplexity'])
+        print(f"Perplexity (idx 0)  - Mean: {ppl_arr.mean():.4f}, Std: {ppl_arr.std():.4f}, Min: {ppl_arr.min():.4f}, Max: {ppl_arr.max():.4f}")
+        print(f"  Zero count: {(ppl_arr == 0).sum()} / {len(ppl_arr)}")
+    if feature_stats['id_len_avg']:
+        id_arr = np.array(feature_stats['id_len_avg'])
+        print(f"ID Len Avg (idx 1)  - Mean: {id_arr.mean():.4f}, Std: {id_arr.std():.4f}, Min: {id_arr.min():.4f}, Max: {id_arr.max():.4f}")
+    if feature_stats['style_consistency']:
+        style_arr = np.array(feature_stats['style_consistency'])
+        print(f"Style Consistency    - Mean: {style_arr.mean():.4f}, Std: {style_arr.std():.4f}")
+    if feature_stats['line_len_std']:
+        line_arr = np.array(feature_stats['line_len_std'])
+        print(f"Line Len Std (idx 7)- Mean: {line_arr.mean():.4f}, Std: {line_arr.std():.4f}")
+    print("="*60 + "\n")
+
+    # Print probability distribution
+    prob_arr = np.array(all_probabilities)
+    print(f"Probability Stats - Class 0 (Human): mean={prob_arr[:, 0].mean():.4f}, std={prob_arr[:, 0].std():.4f}")
+    print(f"                  - Class 1 (AI):     mean={prob_arr[:, 1].mean():.4f}, std={prob_arr[:, 1].std():.4f}")
+    print("="*60 + "\n")
 
     all_ids = test_df['id'].tolist()
 
@@ -239,8 +343,11 @@ def generate_submission(args):
     print("SUBMISSION GENERATION COMPLETE".center(60))
     print("="*60)
     print(f"Total predictions: {len(submission_df)}")
-    print(f"Human (0): {(submission_df['label'] == 0).sum()}")
-    print(f"AI (1): {(submission_df['label'] == 1).sum()}")
+    # NOTE: According to official SemEval Task A convention:
+    # - 0 = machine-generated (AI)
+    # - 1 = human-written (Human)
+    print(f"AI (0): {(submission_df['label'] == 0).sum()}")
+    print(f"Human (1): {(submission_df['label'] == 1).sum()}")
     print(f"Output file: {output_path}")
     print("="*60 + "\n")
     
@@ -277,12 +384,17 @@ if __name__ == "__main__":
         help="Path where the submission CSV will be saved (default: submission.csv)"
     )
     parser.add_argument(
-        "--batch_size", 
-        type=int, 
+        "--batch_size",
+        type=int,
         default=32,
         help="Batch size for inference (default: 32)"
     )
-    
+    parser.add_argument(
+        "--force_reextract",
+        action="store_true",
+        help="Force re-extraction of features even if cached file exists"
+    )
+
     args = parser.parse_args()
     
     submission_df = generate_submission(args)

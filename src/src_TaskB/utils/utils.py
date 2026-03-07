@@ -84,9 +84,10 @@ def set_seed(seed: int = 42):
 def evaluate_model(model, dataloader, device, label_names=None):
     model.eval()
     loss_accum = 0.0
+    valid_batches = 0  # FIX: Track valid batches for NaN handling
     all_preds = []
     all_labels = []
-    
+
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating", leave=False):
             input_ids = batch["input_ids"].to(device)
@@ -108,13 +109,19 @@ def evaluate_model(model, dataloader, device, label_names=None):
                 logits, loss, _ = outputs
             else:
                 logits, loss = outputs
-            
-            loss_accum += loss.item()
+
+            # FIX: Handle NaN loss - skip invalid batches
+            loss_val = loss.item()
+            if not torch.isnan(loss) and not torch.isinf(loss):
+                loss_accum += loss_val
+                valid_batches += 1
+
             preds = torch.argmax(logits, dim=1).cpu().numpy()
             all_preds.extend(preds)
             all_labels.extend(labels.cpu().numpy())
 
-    final_loss = loss_accum / len(dataloader)
+    # FIX: Calculate mean only from valid batches
+    final_loss = loss_accum / valid_batches if valid_batches > 0 else 0.0
     metrics = {
         "loss": final_loss,
         "accuracy": accuracy_score(all_labels, all_preds),
